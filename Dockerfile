@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+# Go 1.23 已停止安全维护，构建工具链固定到当前稳定版 1.27.3
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
 
 ARG VERSION=0.2.33
 ARG COMMIT=unknown

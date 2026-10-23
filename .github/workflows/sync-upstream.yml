@@ -1,0 +1,160 @@
+name: sync-upstream
+
+# 同步上游，同时守住本 fork 的两条固定项：
+#   1) Dockerfile 构建工具链固定 golang:1.27.3-alpine（上游仍是 1.23，已 EOL）
+#   2) go.mod 的 go directive 固定 1.27.3
+# 守卫：上游删库 / 归档 / 只留 README / 文件数塌缩 / 合并冲突 / 构建测试失败 → 不推送。
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只演练（合并 + 构建 + 测试，不推送）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: 525815266/YYB-Go-Enhanced
+  PIN_GO: "1.27.3"
+  DOCKERFILE_FROM: 'FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 安装固定 Go 工具链
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.PIN_GO }}
+          cache: true
+
+      - name: 上游守卫 + 合并 + 固定项恢复 + 构建验证
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -uo pipefail
+          OUT="$GITHUB_OUTPUT"
+          DRY="${DRY_RUN:-false}"
+
+          skip() {
+            echo "::notice title=跳过同步::$1"
+            { echo "### 跳过同步"; echo; echo "**原因**：$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          fail() {
+            echo "::error title=同步失败::$1"
+            { echo "### 同步失败（本仓库未被修改）"; echo; echo "**原因**：$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # 守卫 1：上游存在、未归档、未禁用
+          info=$(gh api "repos/$UPSTREAM" 2>/dev/null) || skip "上游仓库不可访问（已删除、改名或转私有）"
+          [ "$(jq -r '.archived // false' <<<"$info")" = "true" ] && skip "上游仓库已归档"
+          [ "$(jq -r '.disabled // false' <<<"$info")" = "true" ] && skip "上游仓库已禁用"
+
+          # 守卫 2：关键文件齐全（防「只留 README」）
+          for p in go.mod Dockerfile cmd/yyb-go/main.go resource/templates/index.html; do
+            gh api "repos/$UPSTREAM/contents/$p?ref=main" >/dev/null 2>&1 || skip "上游缺少关键文件：$p"
+          done
+
+          # 守卫 3：文件规模不塌缩
+          SHA=$(gh api "repos/$UPSTREAM/commits/main" --jq .sha) || skip "取不到上游提交"
+          TREE=$(gh api "repos/$UPSTREAM/git/trees/$SHA?recursive=1") || skip "取不到上游文件树"
+          UP_BLOBS=$(jq '[.tree[]|select(.type=="blob")]|length' <<<"$TREE")
+          LOCAL_BLOBS=$(git ls-tree -r --name-only origin/main | wc -l | tr -d ' ')
+          if [ "$LOCAL_BLOBS" -gt 0 ] && [ $((UP_BLOBS * 10)) -lt $((LOCAL_BLOBS * 6)) ]; then
+            skip "上游文件数塌缩：${UP_BLOBS} 个（本仓库 ${LOCAL_BLOBS} 个）"
+          fi
+
+          # 拉取并判断是否有新提交
+          git remote add upstream "https://github.com/$UPSTREAM.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream main || skip "拉取上游失败"
+          UP_HEAD=$(git rev-parse FETCH_HEAD)
+          AHEAD=$(git rev-list --count "origin/main..$UP_HEAD" || echo 0)
+          if [ "$AHEAD" -eq 0 ]; then
+            skip "已是最新（上游无本仓库尚未包含的提交）"
+          fi
+
+          # 合并
+          git config user.name "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
+          if ! git merge --no-ff --no-edit -m "chore(sync): 合并上游 ${UP_HEAD:0:8}" "$UP_HEAD" > /tmp/merge.log 2>&1; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git merge --abort || true
+            tail -20 /tmp/merge.log
+            fail "合并冲突，需人工处理：${CONFLICTS:-见日志}"
+          fi
+
+          # 固定项恢复：上游若把工具链改回旧版本，这里强制拉回
+          python3 - "$PIN_GO" "$DOCKERFILE_FROM" <<'PY'
+          import re, sys
+          pin, from_line = sys.argv[1], sys.argv[2]
+          changed = []
+          df = open("Dockerfile", encoding="utf-8").read().splitlines(keepends=True)
+          hit = False
+          for i, line in enumerate(df):
+              if re.match(r"^FROM\s+.*golang:[0-9.]+-alpine\s+AS\s+build\s*$", line):
+                  if line.rstrip("\n") != from_line:
+                      df[i] = from_line + "\n"
+                      changed.append("Dockerfile")
+                  hit = True
+                  break
+          if not hit:
+              pos = 1 if df and df[0].startswith("# syntax") else 0
+              df.insert(pos, from_line + "\n")
+              changed.append("Dockerfile(insert)")
+          open("Dockerfile", "w", encoding="utf-8").writelines(df)
+
+          gm = open("go.mod", encoding="utf-8").read()
+          new = re.sub(r"(?m)^go\s+[0-9][0-9.]*$", f"go {pin}", gm, count=1)
+          if new != gm:
+              open("go.mod", "w", encoding="utf-8").write(new)
+              changed.append("go.mod")
+          print("PINS_CHANGED=" + (",".join(changed) if changed else ""))
+          PY
+
+          if ! git diff --quiet; then
+            git add Dockerfile go.mod
+            git commit -q -m "chore(build): 合并后保持 Go 工具链固定为 ${PIN_GO}"
+            echo "已恢复固定项：$(git show --stat --oneline HEAD | tail -2 | tr '\n' ' ')"
+          fi
+
+          # 合并后验证：能编译、测试通过
+          if ! go build ./... ; then
+            git reset --hard origin/main
+            fail "合并后 go build 失败，已回滚"
+          fi
+          if ! go test ./... ; then
+            git reset --hard origin/main
+            fail "合并后 go test 失败，已回滚"
+          fi
+
+          MERGED=$(git rev-parse HEAD)
+
+          if [ "$DRY" = "true" ]; then
+            git reset --hard origin/main
+            echo "::notice title=演练通过::$AHEAD 个提交可合并，构建与测试通过，未推送"
+            exit 0
+          fi
+
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
+          { echo "### 同步完成"; echo; echo "- 上游提交：\`${UP_HEAD:0:8}\`"; echo "- 合并结果：\`${MERGED:0:8}\`"; echo "- 新增上游提交：$AHEAD"; echo "- 已确认 Dockerfile / go.mod 固定 Go ${PIN_GO}"; } >> "$GITHUB_STEP_SUMMARY"

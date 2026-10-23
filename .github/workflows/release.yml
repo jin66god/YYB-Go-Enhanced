@@ -74,6 +74,12 @@ jobs:
             sleep $((attempt * 10))
           done
 
+      - name: 安装 go.mod 指定的 Go 工具链
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: 解析待发布的版本号与标签
         id: version
         env:

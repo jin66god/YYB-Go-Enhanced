@@ -2,7 +2,7 @@
 # Go 1.23 已停止安全维护，构建工具链固定到当前稳定版 1.27.3
 FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
 
-ARG VERSION=0.2.35
+ARG VERSION=0.2.39
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 ARG TARGETOS=linux
@@ -21,12 +21,13 @@ RUN for attempt in 1 2 3; do \
 COPY cmd ./cmd
 COPY internal ./internal
 COPY resource ./resource
+COPY VERSION Dockerfile ./
 RUN go test ./...
 RUN test -n "$TARGETARCH" \
     && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath -ldflags="-s -w -X yyb_go/internal/version.Version=${VERSION} -X yyb_go/internal/version.Commit=${COMMIT} -X yyb_go/internal/version.BuildDate=${BUILD_DATE}" -o /out/yyb-go ./cmd/yyb-go
 
 FROM alpine:3.21
-ARG VERSION=0.2.35
+ARG VERSION=0.2.39
 LABEL org.opencontainers.image.version=$VERSION
 
 RUN apk add --no-cache ca-certificates tzdata wget \
